@@ -6549,42 +6549,7 @@ async def handle_folder_check(msg: types.Message, state: FSMContext, folder_link
 
         check_tasks = [asyncio.create_task(_check_chat(chat_info)) for chat_info in chats]
         results = await asyncio.gather(*check_tasks)
-
-        # Отправляем результаты
-        stats_text = f"📁 <b>{folder_title}</b>\nПроверено: {len(results)}/{len(chats)}"
-        if results:
-            await send_mass_check_results(msg, results, progress_msg, stats_text, language)
-        else:
-            await progress_msg.edit_text("❌ Нет результатов")
-
-        try:
-            await folder_checker.cleanup_folder_and_leave_chats(client, filter_id, chats, just_imported)
-        except Exception as e:
-            logger.error(f"Ошибка очистки: {e}")
-
-    except Exception as e:
-        logger.error(f"Ошибка: {e}")
-        await msg.answer(f"❌ Ошибка: {str(e)[:100]}")
-    finally:
-        # Гарантированная очистка
-        if client and folder_data:
-            try:
-                await folder_checker.cleanup_folder_and_leave_chats(
-                    client,
-                    folder_data.get("filter_id"),
-                    folder_data.get("chats", []),
-                    folder_data.get("just_imported", False)
-                )
-            except Exception as e:
-                logger.error(f"Ошибка финальной очистки: {e}")
-
-        if session_path:
-            await session_manager.release_client(session_path)
-        if client:
-            try:
-                await client.disconnect()
-            except:
-                pass
+       
 
 
 async def analyze_entity_full(client, entity, chat_info, language):
