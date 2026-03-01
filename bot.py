@@ -7673,10 +7673,6 @@ async def handle_mass_check(msg: types.Message, state: FSMContext):
         flood_wait_errors = 0
         session_errors = 0
 
-        # СЧЕТЧИКИ ДЛЯ МОНИТОРИНГА СЕССИЙ
-        session_usage_counter = {}
-        last_session_check = 0
-
         async def _update_mass_progress(checked_count: int):
             progress_text = (
                 f"{user_manager.get_text(language, 'mass_check_progress')}\n"
@@ -7689,79 +7685,89 @@ async def handle_mass_check(msg: types.Message, state: FSMContext):
             )
             await progress_msg.edit_text(progress_text, parse_mode=ParseMode.HTML)
 
+        checked_count = 0
+        state_lock = asyncio.Lock()
+        # Ограничиваем параллельность: быстрее, но бережно к флуд-вейтам
+        mass_concurrency = 2 if total >= 2 else 1
+        link_queue: asyncio.Queue[tuple[int, str]] = asyncio.Queue()
+
         for i, link in enumerate(valid_links, 1):
-            try:
-                logger.info(f"🔍 [MASS CHECK PROCESSING] Проверка {i}/{total}: '{link}'")
+            link_queue.put_nowait((i, link))
 
-                # ДОБАВЛЯЕМ ЗАДЕРЖКУ МЕЖДУ ПРОВЕРКАМИ ДЛЯ СНИЖЕНИЯ НАГРУЗКИ
-                if i > 1:
-                    delay = 1.5  # 1.5 секунды между проверками
-                    await asyncio.sleep(delay)
+        async def _process_mass_link(worker_id: int):
+            nonlocal checked_count, successful_checks, failed_checks, invalid_links_count
+            nonlocal user_profiles_count, flood_wait_errors, session_errors
 
-                result = await analyze_group_by_link(link, msg.from_user.id, None)
+            while not link_queue.empty():
+                try:
+                    i, link = link_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
 
-                # Классифицируем результат
-                if result.get("is_user_profile"):
-                    user_profiles_count += 1
-                    await user_manager.add_check(msg.from_user.id, username, result)
-                    results.append(result)
-                    logger.info(f"👤 [MASS CHECK USER PROFILE] Профиль пользователя: '{link}'")
+                try:
+                    logger.info(f"🔍 [MASS CHECK PROCESSING] Worker {worker_id}, проверка {i}/{total}: '{link}'")
+                    result = await analyze_group_by_link(link, msg.from_user.id, None)
 
-                elif result.get("is_invalid_link"):
-                    invalid_links_count += 1
-                    await user_manager.add_check(msg.from_user.id, username, result)
-                    results.append(result)
-                    logger.info(f"❌ [MASS CHECK INVALID] Невалидная ссылка: '{link}'")
+                    async with state_lock:
+                        if result.get("is_user_profile"):
+                            user_profiles_count += 1
+                            await user_manager.add_check(msg.from_user.id, username, result)
+                            results.append(result)
 
-                elif not result.get("is_bad"):
-                    results.append(result)
-                    successful_checks += 1
-                    await user_manager.add_check(msg.from_user.id, username, result)
-                    logger.info(f"✅ [MASS CHECK SUCCESS] Успешно проверено: '{link}'")
+                        elif result.get("is_invalid_link"):
+                            invalid_links_count += 1
+                            await user_manager.add_check(msg.from_user.id, username, result)
+                            results.append(result)
 
-                else:
-                    failed_checks += 1
+                        elif not result.get("is_bad"):
+                            successful_checks += 1
+                            await user_manager.add_check(msg.from_user.id, username, result)
+                            results.append(result)
 
-                    # АНАЛИЗИРУЕМ ТИП ОШИБКИ
-                    error_msg = result.get("error_message", "")
-                    if "flood" in error_msg.lower() or "Flood" in error_msg:
-                        flood_wait_errors += 1
-                        logger.warning(f"🌀 [MASS CHECK FLOOD] Флуд-вейт ошибка: '{link}' - {error_msg}")
-                    elif "session" in error_msg.lower():
-                        session_errors += 1
-                        logger.warning(f"🔌 [MASS CHECK SESSION] Ошибка сессии: '{link}' - {error_msg}")
+                        else:
+                            failed_checks += 1
+                            error_msg = result.get("error_message", "")
+                            if "flood" in error_msg.lower() or "Flood" in error_msg:
+                                flood_wait_errors += 1
+                            elif "session" in error_msg.lower():
+                                session_errors += 1
 
-                    await user_manager.add_check(msg.from_user.id, username, result)
-                    results.append(result)
-                    logger.info(f"⚠️ [MASS CHECK FAILED] Ошибка проверки: '{link}' - {error_msg}")
+                            await user_manager.add_check(msg.from_user.id, username, result)
+                            results.append(result)
 
-                await _update_mass_progress(i)
+                        checked_count += 1
+                        await _update_mass_progress(checked_count)
 
-            except Exception as e:
-                log_error(f"Mass check error: {str(e)}")
-                logger.error(f"❌ [MASS CHECK ERROR] Ошибка при проверке '{link}': {e}")
-                failed_checks += 1
+                except Exception as e:
+                    log_error(f"Mass check error: {str(e)}")
+                    logger.error(f"❌ [MASS CHECK ERROR] Ошибка при проверке '{link}': {e}")
 
-                # АНАЛИЗИРУЕМ ТИП ИСКЛЮЧЕНИЯ
-                if "flood" in str(e).lower() or "Flood" in str(e):
-                    flood_wait_errors += 1
-                elif "session" in str(e).lower():
-                    session_errors += 1
+                    async with state_lock:
+                        failed_checks += 1
+                        if "flood" in str(e).lower() or "Flood" in str(e):
+                            flood_wait_errors += 1
+                        elif "session" in str(e).lower():
+                            session_errors += 1
 
-                # Добавляем запись об ошибке
-                error_result = {
-                    "chat_link": link,
-                    "created_date": None,
-                    "owner_username": f"Error: {str(e)[:50]}" if language == 'en' else f"Ошибка: {str(e)[:50]}",
-                    "owner_id": None,
-                    "user_messages": 0,
-                    "checked_at": datetime.now(),
-                    "is_bad": True,
-                    "error_message": str(e)
-                }
-                results.append(error_result)
-                await user_manager.add_check(msg.from_user.id, username, error_result)
-                await _update_mass_progress(i)
+                        error_result = {
+                            "chat_link": link,
+                            "created_date": None,
+                            "owner_username": f"Error: {str(e)[:50]}" if language == 'en' else f"Ошибка: {str(e)[:50]}",
+                            "owner_id": None,
+                            "user_messages": 0,
+                            "checked_at": datetime.now(),
+                            "is_bad": True,
+                            "error_message": str(e)
+                        }
+                        results.append(error_result)
+                        await user_manager.add_check(msg.from_user.id, username, error_result)
+                        checked_count += 1
+                        await _update_mass_progress(checked_count)
+                finally:
+                    link_queue.task_done()
+
+        workers = [asyncio.create_task(_process_mass_link(w + 1)) for w in range(mass_concurrency)]
+        await asyncio.gather(*workers)
 
         # ОБНОВЛЯЕМ ЛИМИТЫ
         try:
