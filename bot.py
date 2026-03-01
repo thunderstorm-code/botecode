@@ -6478,76 +6478,78 @@ async def handle_folder_check(msg: types.Message, state: FSMContext, folder_link
         )
 
         results = []
+        progress_lock = asyncio.Lock()
+        completed = 0
+        total_chats = len(chats)
+        folder_concurrency = min(4, max(1, total_chats))
+        semaphore = asyncio.Semaphore(folder_concurrency)
 
-        for i, chat_info in enumerate(chats, 1):
-            try:
-                entity = chat_info.get("entity")
-                if not entity:
-                    logger.error(f"Нет entity для чата {chat_info}")
-                    continue
+        def _folder_display_link(chat_info: dict) -> tuple[str, str]:
+            if chat_info.get("username"):
+                link = f"t.me/{chat_info['username']}"
+                return link, link
 
-                await progress_msg.edit_text(
-                    f"📁 <b>{folder_title}</b>\n"
-                    f"Проверка: {i}/{len(chats)}\n"
-                    f"Текущий: {chat_info.get('title', 'Chat')[:20]}...",
-                    parse_mode=ParseMode.HTML
-                )
+            chat_title = (chat_info.get("title") or "Unknown chat").strip()
+            chat_id = chat_info.get('id', 'unknown')
+            display_link = f"{chat_title} (ID:{chat_id})"
+            return display_link, str(chat_id)
 
-                # Получаем ссылку для отображения
-                if chat_info.get("username"):
-                    display_link = f"t.me/{chat_info['username']}"
-                    # Для публичных используем ссылку
-                    raw_link = f"t.me/{chat_info['username']}"
-                else:
-                    display_link = f"ID:{chat_info['id']}"
-                    # Для приватных используем ID (он будет обработан в _analyze_group_internal)
-                    raw_link = str(chat_info['id'])
+        async def _check_chat(chat_info: dict):
+            nonlocal completed
+            async with semaphore:
+                display_link, raw_link = _folder_display_link(chat_info)
+                try:
+                    entity = chat_info.get("entity")
+                    if not entity:
+                        raise ValueError("Нет entity для чата")
 
-                # ВАЖНО: Вызываем внутреннюю функцию напрямую, передавая существующий client
-                # Это предотвращает попытку получить новую сессию
-                result = await _analyze_group_internal(
-                    client=client,
-                    raw_link=raw_link,
-                    requester_id=user_id,
-                    progress_msg=None,  # Не обновляем прогресс для каждого чата отдельно
-                    language=language,
-                    session_path=session_path,
-                    pre_fetched_entity=entity  # Передаем уже полученный entity
-                )
+                    result = await _analyze_group_internal(
+                        client=client,
+                        raw_link=raw_link,
+                        requester_id=user_id,
+                        progress_msg=None,
+                        language=language,
+                        session_path=session_path,
+                        pre_fetched_entity=entity
+                    )
 
-                # Добавляем метаданные папки
-                result["from_folder"] = True
-                result["folder_name"] = folder_title
+                    result["from_folder"] = True
+                    result["folder_name"] = folder_title
+                    if not result.get("chat_link"):
+                        result["chat_link"] = display_link
 
-                if not result.get("chat_link"):
-                    result["chat_link"] = display_link
+                    logger.info(f"✅ Проверен чат из папки: {display_link}")
+                    return result
+                except Exception as e:
+                    logger.error(f"❌ Ошибка проверки чата {chat_info}: {e}")
+                    return {
+                        "is_bad": True,
+                        "chat_link": display_link,
+                        "error": str(e),
+                        "error_message": str(e),
+                        "title": chat_info.get("title", "Error"),
+                        "creator": {"ru": "Ошибка", "en": "Error"},
+                        "created": {"ru": "не определена", "en": "not determined"},
+                        "messages_count": 0,
+                        "members": 0,
+                        "type": "Error",
+                        "review": {"ru": f"⚠️ {str(e)[:30]}", "en": f"⚠️ {str(e)[:30]}"},
+                        "cost": 0,
+                        "from_folder": True,
+                        "folder_name": folder_title
+                    }
+                finally:
+                    async with progress_lock:
+                        completed += 1
+                        await progress_msg.edit_text(
+                            f"📁 <b>{folder_title}</b>\n"
+                            f"Проверено: {completed}/{total_chats}\n"
+                            f"⚡ Параллельно: {folder_concurrency}",
+                            parse_mode=ParseMode.HTML
+                        )
 
-                results.append(result)
-
-                logger.info(f"✅ Проверен чат {i}/{len(chats)}: {display_link}")
-
-                # Небольшая задержка между чатами
-                await asyncio.sleep(2)
-
-            except Exception as e:
-                logger.error(f"❌ Ошибка проверки чата {chat_info}: {e}")
-                # Добавляем результат с ошибкой
-                results.append({
-                    "is_bad": True,
-                    "chat_link": f"ID:{chat_info.get('id', 'unknown')}" if not chat_info.get(
-                        'username') else f"t.me/{chat_info['username']}",
-                    "error": str(e),
-                    "title": chat_info.get("title", "Error"),
-                    "creator": {"ru": "Ошибка", "en": "Error"},
-                    "created": {"ru": "не определена", "en": "not determined"},
-                    "messages_count": 0,
-                    "members": 0,
-                    "type": "Error",
-                    "review": {"ru": f"⚠️ {str(e)[:30]}", "en": f"⚠️ {str(e)[:30]}"},
-                    "cost": 0,
-                    "from_folder": True,
-                    "folder_name": folder_title
-                })
+        check_tasks = [asyncio.create_task(_check_chat(chat_info)) for chat_info in chats]
+        results = await asyncio.gather(*check_tasks)
 
         # Отправляем результаты
         stats_text = f"📁 <b>{folder_title}</b>\nПроверено: {len(results)}/{len(chats)}"
@@ -8009,55 +8011,39 @@ async def process_mass_check_from_list(msg: types.Message, links: list, progress
             await msg.answer(error_text)
 
 def format_mass_check_text(results: list, language: str = 'ru') -> str:
-    """Форматирует результаты массовой проверки в новом формате"""
-    if language == 'en':
-        lines = []
-    else:
-        lines = []
+    """Форматирует результаты массовой проверки в расширенном формате (как в одиночной проверке)."""
+    lines = []
 
     total_price = 0
     year_counter = Counter()
     invalid_links_count = 0
-    user_profiles_count = 0
     valid_groups_count = 0
     error_groups_count = 0
     imported_groups_count = 0
     geo_groups_count = 0
 
-    # Собираем статистику
     for result in results:
-        # ОСОБЫЕ СЛУЧАИ: профиль пользователя
         if result.get("is_user_profile"):
-            user_profiles_count += 1
             continue
-
-        # ОСОБЫЕ СЛУЧАИ: невалидная ссылка
         if result.get("is_invalid_link"):
             invalid_links_count += 1
             continue
-
-        # ОСОБЫЕ СЛУЧАИ: ошибка проверки
         if result.get("is_bad"):
             error_groups_count += 1
             continue
 
-        # Обычная группа/канал (успешная проверка)
         valid_groups_count += 1
+        total_price += result.get('price') or 0
 
-        # Считаем статистику
-        price = result.get('price') or 0
-        total_price += price
-
-        if result.get('created_date'):
-            year_counter[result['created_date'].year] += 1
+        created_date = result.get('created_date')
+        if isinstance(created_date, datetime):
+            year_counter[created_date.year] += 1
 
         if result.get("has_imported_messages"):
             imported_groups_count += 1
-
         if result.get("has_geo_location"):
             geo_groups_count += 1
 
-    # ЗАГОЛОВОК И СТАТИСТИКА
     if language == 'en':
         lines.append("✅ <b>Mass check completed!</b>")
         lines.append("")
@@ -8069,7 +8055,7 @@ def format_mass_check_text(results: list, language: str = 'ru') -> str:
         if valid_groups_count > 0:
             lines.append(f"• 💰 Total price: {total_price}$")
         if year_counter:
-            lines.append(f"• 📅 Creation years:")
+            lines.append("• 📅 Creation years:")
             for year, count in sorted(year_counter.items(), reverse=True):
                 lines.append(f"     {year}: {count} groups")
     else:
@@ -8083,273 +8069,49 @@ def format_mass_check_text(results: list, language: str = 'ru') -> str:
         if valid_groups_count > 0:
             lines.append(f"• 💰 Общая стоимость: {total_price}$")
         if year_counter:
-            lines.append(f"• 📅 Годы создания:")
+            lines.append("• 📅 Годы создания:")
             for year, count in sorted(year_counter.items(), reverse=True):
                 lines.append(f"     {year}: {count} групп")
 
-    # ПРЕДУПРЕЖДЕНИЯ
     if imported_groups_count > 0:
-        if language == 'en':
-            lines.append("")
-            lines.append("‼️ <b>IMPORT GROUP DETECTED</b>")
-        else:
-            lines.append("")
-            lines.append("‼️ <b>ОБНАРУЖЕНЫ ИМПОРТИРОВАННЫЕ ГРУППЫ</b>")
+        lines.append("")
+        lines.append("‼️ <b>IMPORT GROUP DETECTED</b>" if language == 'en' else "‼️ <b>ОБНАРУЖЕНЫ ИМПОРТИРОВАННЫЕ ГРУППЫ</b>")
 
     if geo_groups_count > 0:
-        if language == 'en':
-            lines.append("‼️ <b>GEO-GROUP DETECTED</b>")
-        else:
-            lines.append("‼️ <b>ОБНАРУЖЕНЫ ГЕО-ГРУППЫ</b>")
+        lines.append("‼️ <b>GEO-GROUP DETECTED</b>" if language == 'en' else "‼️ <b>ОБНАРУЖЕНЫ ГЕО-ГРУППЫ</b>")
 
-    # РЕЗУЛЬТАТЫ
     lines.append("")
-    if language == 'en':
-        lines.append("🔎 <b>Results:</b>")
-    else:
-        lines.append("🔎 <b>Результаты:</b>")
+    lines.append("🔎 <b>Results:</b>" if language == 'en' else "🔎 <b>Результаты:</b>")
     lines.append("")
 
-    # ВЫВОД КАЖДОЙ ГРУППЫ
     group_counter = 0
-    for i, result in enumerate(results, 1):
-        # Пропускаем невалидные ссылки и профили пользователей в основном списке
+    for result in results:
         if result.get("is_user_profile") or result.get("is_invalid_link") or result.get("is_bad"):
             continue
 
         group_counter += 1
+        display_link = format_link_for_display(result.get('chat_link', ''))
+        lines.append(f"<b>{group_counter}. {display_link}</b>")
+        lines.append("<blockquote>" + "\n".join(build_result_info_lines(result, language)) + "</blockquote>")
 
-        # Форматируем ссылку для отображения
-        display_link = format_link_for_display(result['chat_link'])
-        lines.append(f"{group_counter}. {display_link}")
-
-        # Дата создания
-        created_date = result.get('created_date')
-        date_str = format_date(created_date, language) if created_date else user_manager.get_text(language,
-                                                                                                  'date_not_defined')
-
-        # Владелец
-        owner_username = result.get('owner_username')
-        owner_id = result.get('owner_id')
-        owner_first_name = result.get('owner_first_name')
-        owner_last_name = result.get('owner_last_name')
-
-        owner_display = format_owner_display_with_name(owner_username, owner_id, owner_first_name, owner_last_name,
-                                                       language)
-
-        # Сообщения пользователей
-        user_messages = result.get('user_messages', 0)
-
-        if language == 'en':
-            lines.append(f"   📅 Date: {date_str}")
-            lines.append(f"   👤 Owner: {owner_display}")
-            lines.append(f"   💬 Messages: {user_messages}")
-        else:
-            lines.append(f"   📅 Дата: {date_str}")
-            lines.append(f"   👤 Владелец: {owner_display}")
-            lines.append(f"   💬 Сообщения: {user_messages}")
-
-        # Дополнительная информация (гео-группа)
-        if result.get('has_geo_location'):
-            if language == 'en':
-                lines.append(f"   📍 Geo-group")
-            else:
-                lines.append(f"   📍 Гео-группа")
-
-        # Дополнительная информация (импортированные сообщения)
+        warnings_lines = []
         if result.get("has_imported_messages"):
-            if language == 'en':
-                lines.append(f"   ⚠️ Group imported")
-            else:
-                lines.append(f"   ⚠️ Группа импортирована")
+            warnings_lines.append(f"📥 {user_manager.get_text(language, 'imported_messages')}")
+        if result.get("has_geo_location"):
+            warnings_lines.append(f"📍 {user_manager.get_text(language, 'geo_group')}")
+        if warnings_lines:
+            warnings_title = user_manager.get_text(language, 'warnings_title')
+            lines.append(f"❗ <b>{warnings_title}:</b>")
+            lines.append("<blockquote>" + "\n".join(warnings_lines) + "</blockquote>")
 
-        if result.get('price'):
-            if language == 'en':
-                lines.append(f"   💰 Price: {result['price']}$")
-            else:
-                lines.append(f"   💰 Стоимость: {result['price']}$")
+        lines.append("")
 
-        if result.get('history_hidden'):
-            if language == 'en':
-                lines.append(f"   🔒 History hidden")
-            else:
-                lines.append(f"   🔒 История скрыта")
-
-        lines.append("")  # Пустая строка между группами
-
-    # ВРЕМЯ ПРОВЕРКИ
-    if language == 'en':
-        lines.append(f"• ⏱️ Check time: {datetime.now().strftime('%d.%m.%Y %H:%M')}")
-    else:
-        lines.append(f"• ⏱️ Время проверки: {datetime.now().strftime('%d.%m.%Y %H:%M')}")
-
+    lines.append(f"• ⏱️ <b>{'Check time' if language == 'en' else 'Время проверки'}:</b> {datetime.now().strftime('%d.%m.%Y %H:%M')}")
     return "\n".join(lines)
 
 def format_mass_check_html(results: list, language: str = 'ru') -> str:
-    """Форматирует результаты массовой проверки в HTML с новым форматом"""
-    if language == 'en':
-        lines = []
-    else:
-        lines = []
-
-    total_price = 0
-    year_counter = Counter()
-    invalid_links_count = 0
-    user_profiles_count = 0
-    valid_groups_count = 0
-    error_groups_count = 0
-    imported_groups_count = 0
-    geo_groups_count = 0
-
-    # Собираем статистику
-    for result in results:
-        if result.get("is_user_profile"):
-            user_profiles_count += 1
-            continue
-        if result.get("is_invalid_link"):
-            invalid_links_count += 1
-            continue
-        if result.get("is_bad"):
-            error_groups_count += 1
-            continue
-
-        valid_groups_count += 1
-        price = result.get('price') or 0
-        total_price += price
-
-        if result.get('created_date'):
-            year_counter[result['created_date'].year] += 1
-
-        if result.get("has_imported_messages"):
-            imported_groups_count += 1
-
-        if result.get("has_geo_location"):
-            geo_groups_count += 1
-
-    # ЗАГОЛОВОК И СТАТИСТИКА
-    if language == 'en':
-        lines.append("✅ <b>Mass check completed!</b>")
-        lines.append("")
-        lines.append("📊 <b>Statistics:</b>")
-        lines.append(f"• 🔗 Total links: {len(results)}")
-        lines.append(f"• ✅ Valid groups: {valid_groups_count}")
-        lines.append(f"• ❌ Invalid links: {invalid_links_count}")
-        lines.append(f"• ⚠️ Error groups: {error_groups_count}")
-        if valid_groups_count > 0:
-            lines.append(f"• 💰 Total price: {total_price}$")
-        if year_counter:
-            lines.append(f"• 📅 Creation years:")
-            for year, count in sorted(year_counter.items(), reverse=True):
-                lines.append(f"     {year}: {count} groups")
-    else:
-        lines.append("✅ <b>Массовая проверка завершена!</b>")
-        lines.append("")
-        lines.append("📊 <b>Статистика:</b>")
-        lines.append(f"• 🔗 Всего ссылок: {len(results)}")
-        lines.append(f"• ✅ Валидных групп: {valid_groups_count}")
-        lines.append(f"• ❌ Невалидных ссылок: {invalid_links_count}")
-        lines.append(f"• ⚠️ Ошибочных групп: {error_groups_count}")
-        if valid_groups_count > 0:
-            lines.append(f"• 💰 Общая стоимость: {total_price}$")
-        if year_counter:
-            lines.append(f"• 📅 Годы создания:")
-            for year, count in sorted(year_counter.items(), reverse=True):
-                lines.append(f"     {year}: {count} групп")
-
-    # ПРЕДУПРЕЖДЕНИЯ
-    if imported_groups_count > 0:
-        if language == 'en':
-            lines.append("")
-            lines.append("‼️ <b>IMPORT GROUP DETECTED</b>")
-        else:
-            lines.append("")
-            lines.append("‼️ <b>ОБНАРУЖЕНЫ ИМПОРТИРОВАННЫЕ ГРУППЫ</b>")
-
-    if geo_groups_count > 0:
-        if language == 'en':
-            lines.append("‼️ <b>GEO-GROUP DETECTED</b>")
-        else:
-            lines.append("‼️ <b>ОБНАРУЖЕНЫ ГЕО-ГРУППЫ</b>")
-
-    # РЕЗУЛЬТАТЫ
-    lines.append("")
-    if language == 'en':
-        lines.append("🔎 <b>Results:</b>")
-    else:
-        lines.append("🔎 <b>Результаты:</b>")
-    lines.append("")
-
-    # ВЫВОД КАЖДОЙ ГРУППЫ
-    group_counter = 0
-    for i, result in enumerate(results, 1):
-        if result.get("is_user_profile") or result.get("is_invalid_link") or result.get("is_bad"):
-            continue
-
-        group_counter += 1
-
-        display_link = format_link_for_display(result['chat_link'])
-        lines.append(f"<b>{group_counter}. {display_link}</b>")
-
-        # Дата создания
-        created_date = result.get('created_date')
-        date_str = format_date(created_date, language) if created_date else user_manager.get_text(language,
-                                                                                                  'date_not_defined')
-
-        # Владелец
-        owner_username = result.get('owner_username')
-        owner_id = result.get('owner_id')
-        owner_first_name = result.get('owner_first_name')
-        owner_last_name = result.get('owner_last_name')
-
-        owner_display = format_owner_display_with_name(owner_username, owner_id, owner_first_name, owner_last_name,
-                                                       language)
-
-        # Сообщения пользователей
-        user_messages = result.get('user_messages', 0)
-
-        if language == 'en':
-            lines.append(f"   📅 <b>Date:</b> {date_str}")
-            lines.append(f"   👤 <b>Owner:</b> {owner_display}")
-            lines.append(f"   💬 <b>Messages:</b> {user_messages}")
-        else:
-            lines.append(f"   📅 <b>Дата:</b> {date_str}")
-            lines.append(f"   👤 <b>Владелец:</b> {owner_display}")
-            lines.append(f"   💬 <b>Сообщения:</b> {user_messages}")
-
-        # Дополнительная информация
-        if result.get('has_geo_location'):
-            if language == 'en':
-                lines.append(f"   📍 <b>Geo-group</b>")
-            else:
-                lines.append(f"   📍 <b>Гео-группа</b>")
-
-        if result.get("has_imported_messages"):
-            if language == 'en':
-                lines.append(f"   ⚠️ <b>Group imported</b>")
-            else:
-                lines.append(f"   ⚠️ <b>Группа импортирована</b>")
-
-        if result.get('price'):
-            if language == 'en':
-                lines.append(f"   💰 <b>Price:</b> {result['price']}$")
-            else:
-                lines.append(f"   💰 <b>Стоимость:</b> {result['price']}$")
-
-        if result.get('history_hidden'):
-            if language == 'en':
-                lines.append(f"   🔒 <b>History hidden</b>")
-            else:
-                lines.append(f"   🔒 <b>История скрыта</b>")
-
-        lines.append("")
-
-    # ВРЕМЯ ПРОВЕРКИ
-    if language == 'en':
-        lines.append(f"• ⏱️ <b>Check time:</b> {datetime.now().strftime('%d.%m.%Y %H:%M')}")
-    else:
-        lines.append(f"• ⏱️ <b>Время проверки:</b> {datetime.now().strftime('%d.%m.%Y %H:%M')}")
-
-    return "\n".join(lines)
+    """Совместимый алиас для форматирования массовой проверки в HTML."""
+    return format_mass_check_text(results, language)
 
 async def send_mass_check_results(msg: types.Message, results: list, progress_msg: types.Message = None,
                                   additional_info: str = "", language: str = 'ru'):
@@ -9535,87 +9297,9 @@ def format_link_for_display(link: str) -> str:
         return link
 
 
-def make_result_message(rec: dict, stats: dict = None, language: str = 'ru'):
-    """Формирует сообщение с результатом"""
 
-    if stats is None:
-        stats = {}
-
-    if rec.get("is_user_profile"):
-        display_link = format_link_for_display(rec['chat_link'])
-
-        if language == 'en':
-            text = (
-                f"🔍 <b>Check Result</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"<b>Link:</b>\n"
-                f"<blockquote>{display_link}</blockquote>\n\n"
-                f"<b>Status:</b>\n"
-                f"<blockquote>❌ {user_manager.get_text(language, 'user_profile_result')}</blockquote>\n\n"
-                f"<i>The link leads to a user profile</i>"
-            )
-        else:
-            text = (
-                f"🔍 <b>Результат проверки</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"<b>Ссылка:</b>\n"
-                f"<blockquote>{display_link}</blockquote>\n\n"
-                f"<b>Статус:</b>\n"
-                f"<blockquote>❌ {user_manager.get_text(language, 'user_profile_result')}</blockquote>\n\n"
-                f"<i>Ссылка ведет на профиль пользователя</i>"
-            )
-        return text, None
-
-    if rec.get("is_invalid_link"):
-        display_link = format_link_for_display(rec['chat_link'])
-        error_msg = rec.get('error_message', user_manager.get_text(language, 'invalid_link_result'))
-
-        if language == 'en':
-            text = (
-                f"🔍 <b>Check Result</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"<b>Link:</b>\n"
-                f"<blockquote>{display_link}</blockquote>\n\n"
-                f"<b>Status:</b>\n"
-                f"<blockquote>❌ {error_msg}</blockquote>\n\n"
-                f"<i>Group or channel not found</i>"
-            )
-        else:
-            text = (
-                f"🔍 <b>Результат проверки</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"<b>Ссылка:</b>\n"
-                f"<blockquote>{display_link}</blockquote>\n\n"
-                f"<b>Статус:</b>\n"
-                f"<blockquote>❌ {error_msg}</blockquote>\n\n"
-                f"<i>Группа или канал не найдены</i>"
-            )
-        return text, None
-
-    if rec.get("error_message"):
-        display_link = format_link_for_display(rec.get('chat_link', ''))
-        if language == 'en':
-            text = (
-                f"🔍 <b>Check Result</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"<b>Link:</b>\n"
-                f"<blockquote>{display_link}</blockquote>\n\n"
-                f"<b>Status:</b>\n"
-                f"<blockquote>❌ Error: {rec['error_message']}</blockquote>"
-            )
-        else:
-            text = (
-                f"🔍 <b>Результат проверки</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"<b>Ссылка:</b>\n"
-                f"<blockquote>{display_link}</blockquote>\n\n"
-                f"<b>Статус:</b>\n"
-                f"<blockquote>❌ Ошибка: {rec['error_message']}</blockquote>"
-            )
-        return text, None
-
-    display_link = format_link_for_display(rec.get('chat_link', ''))
-
+def build_result_info_lines(rec: dict, language: str = 'ru', stats: dict = None) -> list[str]:
+    """Собирает блок детальной информации о группе/канале для одиночной и массовой проверки."""
     info_lines = []
 
     if rec.get("is_channel"):
@@ -9735,6 +9419,91 @@ def make_result_message(rec: dict, stats: dict = None, language: str = 'ru'):
 
     checked_at_str = checked_at.strftime('%d-%m-%Y %H:%M:%S UTC')
     info_lines.append(f"⏱ {user_manager.get_text(language, 'checked_at')}: {checked_at_str}")
+
+    return info_lines
+
+def make_result_message(rec: dict, stats: dict = None, language: str = 'ru'):
+    """Формирует сообщение с результатом"""
+
+    if stats is None:
+        stats = {}
+
+    if rec.get("is_user_profile"):
+        display_link = format_link_for_display(rec['chat_link'])
+
+        if language == 'en':
+            text = (
+                f"🔍 <b>Check Result</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"<b>Link:</b>\n"
+                f"<blockquote>{display_link}</blockquote>\n\n"
+                f"<b>Status:</b>\n"
+                f"<blockquote>❌ {user_manager.get_text(language, 'user_profile_result')}</blockquote>\n\n"
+                f"<i>The link leads to a user profile</i>"
+            )
+        else:
+            text = (
+                f"🔍 <b>Результат проверки</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"<b>Ссылка:</b>\n"
+                f"<blockquote>{display_link}</blockquote>\n\n"
+                f"<b>Статус:</b>\n"
+                f"<blockquote>❌ {user_manager.get_text(language, 'user_profile_result')}</blockquote>\n\n"
+                f"<i>Ссылка ведет на профиль пользователя</i>"
+            )
+        return text, None
+
+    if rec.get("is_invalid_link"):
+        display_link = format_link_for_display(rec['chat_link'])
+        error_msg = rec.get('error_message', user_manager.get_text(language, 'invalid_link_result'))
+
+        if language == 'en':
+            text = (
+                f"🔍 <b>Check Result</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"<b>Link:</b>\n"
+                f"<blockquote>{display_link}</blockquote>\n\n"
+                f"<b>Status:</b>\n"
+                f"<blockquote>❌ {error_msg}</blockquote>\n\n"
+                f"<i>Group or channel not found</i>"
+            )
+        else:
+            text = (
+                f"🔍 <b>Результат проверки</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"<b>Ссылка:</b>\n"
+                f"<blockquote>{display_link}</blockquote>\n\n"
+                f"<b>Статус:</b>\n"
+                f"<blockquote>❌ {error_msg}</blockquote>\n\n"
+                f"<i>Группа или канал не найдены</i>"
+            )
+        return text, None
+
+    if rec.get("error_message"):
+        display_link = format_link_for_display(rec.get('chat_link', ''))
+        if language == 'en':
+            text = (
+                f"🔍 <b>Check Result</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"<b>Link:</b>\n"
+                f"<blockquote>{display_link}</blockquote>\n\n"
+                f"<b>Status:</b>\n"
+                f"<blockquote>❌ Error: {rec['error_message']}</blockquote>"
+            )
+        else:
+            text = (
+                f"🔍 <b>Результат проверки</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"<b>Ссылка:</b>\n"
+                f"<blockquote>{display_link}</blockquote>\n\n"
+                f"<b>Статус:</b>\n"
+                f"<blockquote>❌ Ошибка: {rec['error_message']}</blockquote>"
+            )
+        return text, None
+
+    display_link = format_link_for_display(rec.get('chat_link', ''))
+
+    info_lines = build_result_info_lines(rec, language, stats)
 
     warnings_block = ""
     warnings_lines = []
