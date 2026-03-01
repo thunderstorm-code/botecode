@@ -6543,49 +6543,13 @@ async def handle_folder_check(msg: types.Message, state: FSMContext, folder_link
                         completed += 1
                         await progress_msg.edit_text(
                             f"📁 <b>{folder_title}</b>\n"
-                            f"Проверено: {completed}/{total_chats}\n"
-                            f"⚡ Параллельно: {folder_concurrency}",
+                            f"Проверено: {completed}/{total_chats}",
                             parse_mode=ParseMode.HTML
                         )
 
         check_tasks = [asyncio.create_task(_check_chat(chat_info)) for chat_info in chats]
         results = await asyncio.gather(*check_tasks)
-
-        # Отправляем результаты
-        stats_text = f"📁 <b>{folder_title}</b>\nПроверено: {len(results)}/{len(chats)}"
-        if results:
-            await send_mass_check_results(msg, results, progress_msg, stats_text, language)
-        else:
-            await progress_msg.edit_text("❌ Нет результатов")
-
-        try:
-            await folder_checker.cleanup_folder_and_leave_chats(client, filter_id, chats, just_imported)
-        except Exception as e:
-            logger.error(f"Ошибка очистки: {e}")
-
-    except Exception as e:
-        logger.error(f"Ошибка: {e}")
-        await msg.answer(f"❌ Ошибка: {str(e)[:100]}")
-    finally:
-        # Гарантированная очистка
-        if client and folder_data:
-            try:
-                await folder_checker.cleanup_folder_and_leave_chats(
-                    client,
-                    folder_data.get("filter_id"),
-                    folder_data.get("chats", []),
-                    folder_data.get("just_imported", False)
-                )
-            except Exception as e:
-                logger.error(f"Ошибка финальной очистки: {e}")
-
-        if session_path:
-            await session_manager.release_client(session_path)
-        if client:
-            try:
-                await client.disconnect()
-            except:
-                pass
+       
 
 
 async def analyze_entity_full(client, entity, chat_info, language):
@@ -7505,27 +7469,6 @@ async def handle_mass_check(msg: types.Message, state: FSMContext):
 
     logger.info(f"📊 [SESSION STATUS] Доступно: {available_sessions}/{total_sessions}, Флуд-вейт: {flood_wait_sessions}")
 
-    # ПРЕДУПРЕЖДЕНИЕ О МАЛОМ КОЛИЧЕСТВЕ СЕССИЙ
-    if available_sessions < 3:
-        if language == 'en':
-            warning_msg = await msg.answer(
-                f"⚠️ <b>Low session count warning</b>\n\n"
-                f"• Available sessions: {available_sessions}/{total_sessions}\n"
-                f"• Flood wait sessions: {flood_wait_sessions}\n"
-                f"• Some checks may fail or be delayed\n\n"
-                f"<i>Starting mass check anyway...</i>",
-                parse_mode=ParseMode.HTML
-            )
-        else:
-            warning_msg = await msg.answer(
-                f"⚠️ <b>Внимание: мало сессий</b>\n\n"
-                f"• Доступно сессий: {available_sessions}/{total_sessions}\n"
-                f"• Сессий в флуд-вейте: {flood_wait_sessions}\n"
-                f"• Некоторые проверки могут завершиться ошибкой или задержаться\n\n"
-                f"<i>Начинаем массовую проверку...</i>",
-                parse_mode=ParseMode.HTML
-            )
-
     # ПРОВЕРЯЕМ ЛИМИТЫ
     limit_check = await limit_manager.can_make_request(msg.from_user.id, lines)
     allowed_links = limit_check["allowed"]
@@ -7575,14 +7518,6 @@ async def handle_mass_check(msg: types.Message, state: FSMContext):
             if limit_check['exceeded_private'] > 0:
                 limit_info += f"🔒 Лимит приватных: +{limit_check['exceeded_private']} превышено\n"
             limit_info += f"⏰ До сброса: {limit_check['time_left']}"
-
-    # ДОБАВЛЯЕМ ИНФОРМАЦИЮ О СЕССИЯХ
-    session_info = ""
-    if available_sessions < 5:
-        if language == 'en':
-            session_info = f"\n\n⚠️ <b>Session status:</b> {available_sessions}/{total_sessions} available"
-        else:
-            session_info = f"\n\n⚠️ <b>Статус сессий:</b> {available_sessions}/{total_sessions} доступно"
 
     # Обрабатываем ссылки и удаляем дубликаты
     processed_links = set()
@@ -7688,8 +7623,7 @@ async def handle_mass_check(msg: types.Message, state: FSMContext):
         f"{user_manager.get_text(language, 'mass_check_progress')}\n"
         f"📊 {'Groups to check' if language == 'en' else 'Групп для проверки'}: {len(valid_links)}\n"
         f"🔄 {'Duplicates removed' if language == 'en' else 'Дубликатов удалено'}: {duplicates_count}\n"
-        f"💼 {'Available sessions' if language == 'en' else 'Доступно сессий'}: {available_sessions}/{total_sessions}\n"
-        f"{format_info}{limit_info}{session_info}",
+        f"{format_info}{limit_info}",
         parse_mode=ParseMode.HTML
     )
 
@@ -7712,10 +7646,6 @@ async def handle_mass_check(msg: types.Message, state: FSMContext):
             try:
                 # ПЕРИОДИЧЕСКИ ПРОВЕРЯЕМ СТАТУС СЕССИЙ КАЖДЫЕ 10 ПРОВЕРОК
                 if i % 10 == 0 or i == total:
-                    current_session_stats = await session_manager.get_session_stats()
-                    current_available = current_session_stats["available_sessions"]
-                    current_flood_wait = current_session_stats["flood_wait_sessions"]
-
                     progress_text = (
                         f"{user_manager.get_text(language, 'mass_check_progress')}\n"
                         f"📊 {'Progress' if language == 'en' else 'Прогресс'}: {i}/{total}\n"
@@ -7723,8 +7653,6 @@ async def handle_mass_check(msg: types.Message, state: FSMContext):
                         f"❌ {'Invalid links' if language == 'en' else 'Невалидных ссылок'}: {invalid_links_count}\n"
                         f"👤 {'User profiles' if language == 'en' else 'Профилей пользователей'}: {user_profiles_count}\n"
                         f"⚠️ {'Errors' if language == 'en' else 'Ошибок'}: {failed_checks}\n"
-                        f"🌀 {'Flood waits' if language == 'en' else 'Флуд-вейтов'}: {flood_wait_errors}\n"
-                        f"💼 {'Sessions' if language == 'en' else 'Сессии'}: {current_available}/{current_session_stats['total_sessions']}\n"
                         f"{format_info}"
                     )
                     await progress_msg.edit_text(progress_text, parse_mode=ParseMode.HTML)
@@ -7819,32 +7747,8 @@ async def handle_mass_check(msg: types.Message, state: FSMContext):
         except Exception as e:
             logger.error(f"❌ [LIMITS ERROR] Ошибка обновления лимитов: {e}")
 
-        # ФИНАЛЬНАЯ СТАТИСТИКА СЕССИЙ
-        final_session_stats = await session_manager.get_session_stats()
-        final_available = final_session_stats["available_sessions"]
-        final_flood_wait = final_session_stats["flood_wait_sessions"]
-
-        session_summary = ""
-        if flood_wait_errors > 0 or session_errors > 0:
-            if language == 'en':
-                session_summary = (
-                    f"\n\n🌀 <b>Session Summary:</b>\n"
-                    f"• Flood wait errors: {flood_wait_errors}\n"
-                    f"• Session errors: {session_errors}\n"
-                    f"• Available sessions: {final_available}/{final_session_stats['total_sessions']}\n"
-                    f"• Flood wait sessions: {final_flood_wait}"
-                )
-            else:
-                session_summary = (
-                    f"\n\n🌀 <b>Статистика сессий:</b>\n"
-                    f"• Ошибок флуд-вейта: {flood_wait_errors}\n"
-                    f"• Ошибок сессий: {session_errors}\n"
-                    f"• Доступно сессий: {final_available}/{final_session_stats['total_sessions']}\n"
-                    f"• Сессий в флуд-вейте: {final_flood_wait}"
-                )
-
         # Отправляем результаты
-        await send_mass_check_results(msg, results, progress_msg, session_summary, language)
+        await send_mass_check_results(msg, results, progress_msg, "", language)
 
     except Exception as e:
         logger.error(f"❌ [MASS CHECK CRITICAL ERROR] Ошибка в массовой проверке: {e}")
@@ -8201,6 +8105,13 @@ async def send_text_parts(msg: types.Message, text: str, max_length: int = 4000)
         await msg.answer('\n'.join(current_part), parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 
+def strip_html_for_txt(text: str) -> str:
+    """Удаляет HTML-теги из текста перед сохранением в TXT."""
+    if not text:
+        return ""
+    plain = re.sub(r"<[^>]+>", "", text)
+    return html.unescape(plain)
+
 async def send_results_as_file(msg: types.Message, text_content: str, progress_msg: types.Message = None,
                                groups_count: int = 0, stats_text: str = "", language: str = 'ru'):
     """Отправляет результаты в виде TXT файла с новым форматом"""
@@ -8213,7 +8124,7 @@ async def send_results_as_file(msg: types.Message, text_content: str, progress_m
     try:
         # Сохраняем содержимое в файл
         with open(filename, 'w', encoding='utf-8') as f:
-            f.write(text_content)
+            f.write(strip_html_for_txt(text_content))
 
         # Отправляем файл
         with open(filename, 'rb') as f:
